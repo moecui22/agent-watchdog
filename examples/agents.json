@@ -1,0 +1,23 @@
+{
+  "agents": [
+    {
+      "name": "Research briefing",
+      "due_hour": 9,
+      "output": "~/agents/briefing/{Y}-{m}-{d}.md",
+      "fix": "Re-authenticate the agent CLI; scheduled runs have no session."
+    },
+    {
+      "name": "Video digest",
+      "due_hour": 9,
+      "output": "~/agents/digest/{Y}-{m}-{d}.md",
+      "fix": "The capture step needs Accessibility permission, which an unattended run cannot grant."
+    },
+    {
+      "name": "Nightly backup",
+      "due_hour": 10,
+      "output": "~/backups/latest/*.json",
+      "by_mtime": true,
+      "fix": "Check the backup drive is mounted."
+    }
+  ]
+}

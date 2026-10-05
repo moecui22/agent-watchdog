@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Did each scheduled agent actually do its work? Judged by what it left behind.
+
+Two stages, cheap first:
+
+  1. Code asks whether the agent's output file exists at all. No model, always runs.
+  2. An LLM judge (TypeSafe System One, one yes/no "Noul" per file) asks, of the
+     files that DO exist, whether each one holds the work or only reports that
+     the run was blocked.
+
+Why stage 2: a video-digest agent once wrote a 703-byte file whose whole content
+was "blocked: access can't be approved". That is an artifact, so an existence
+check calls it a success. On four known files the judge scored 0.04 for that
+failure report and 0.77-0.94 for real work; scores in AMBIGUOUS go to a human.
+
+It judges output, never exit status and never duration. Both lied: one agent
+reported "succeeded" five days running in 3-12 seconds while doing nothing.
+
+It reports the STATE, not the run: a notification goes out only when the set of
+problems changes, names the action that fixes each one, and says since when.
+One green report on recovery, then silence.
+
+    agent-watchdog                 one line per agent
+    agent-watchdog --quiet         silent unless something is wrong (for cron/launchd)
+    agent-watchdog --days N        look back N days (default 3)
+    agent-watchdog --no-judge      stage 1 only
+    agent-watchdog --config PATH   default ~/.config/agent-watchdog/agents.json
+    agent-watchdog --selftest      check the state logic and exit
+
+Exit 0 = every agent did its work. Exit 1 = something didn't.
+Needs TYPESAFE_API_KEY for stage 2; without it the check degrades to stage 1 and says so.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from datetime import date, datetime, timedelta
+
+VERSION = "1.0"
+
+HOME = os.path.expanduser("~")
+JUDGE_URL = "https://api.typesafe.ai/v1/systemone"
+CONFIG = HOME + "/.config/agent-watchdog/agents.json"
+STATE = HOME + "/.local/share/agent-watchdog/posted.json"
+# Below AMBIGUOUS[0] the file is a failure report; above [1] it is the work.
+# The observed gap was 0.04 vs 0.77, so the middle is reported as unclear
+# rather than forced either way.
+AMBIGUOUS = (0.35, 0.65)
+
+
+def load_config(path):
+    """agents.json — see examples/agents.json. Each agent:
+    name, due_hour, output (path template with {Y} {m} {d}, may be a glob),
+    optional: by_mtime (overwritten file, only today can be judged), judge (default true),
+    paused (default false), fix (the action a human takes when it fails).
+    Top level: optional "notify" — a command run as [*notify, light, title, body]."""
+    cfg = json.load(open(os.path.expanduser(path)))
+    return cfg.get("agents", []), cfg.get("notify")
+
+
+def normalise(problem):
+    """A problem without its date, so the same fault on two days is one problem."""
+    for marker in (" on ", " wrote only", " may not have"):
+        if marker in problem:
+            head, _, tail = problem.partition(marker)
+            return head if marker == " on " else head + marker + tail.split(" on ")[0]
+    return problem
+
+
+def signature(problems):
+    """What is wrong right now, independent of when and how many times."""
+    return sorted({normalise(p) for p in problems})
+
+
+def title(sig, names_known):
+    """Name the agents, not a count: a number is nothing a human can act on."""
+    names = []
+    for p in sig:
+        for name in names_known:
+            if p.startswith(name) and name not in names:
+                names.append(name)
+    if not names:
+        return "An agent is not doing its work"
+    shown = ", ".join(names[:2]) + (f" and {len(names) - 2} more" if len(names) > 2 else "")
+    return f"{shown} {'is' if len(names) == 1 else 'are'} not doing their work"
+
+
+def read_state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def notify(cmd, light, head, body):
+    if not cmd:
+        return
+    try:
+        subprocess.run([*cmd, light, head, body], check=True, capture_output=True, timeout=60)
+    except Exception as e:                      # noqa: BLE001 — failing to notify matters too
+        print(f"(could not notify: {e})", file=sys.stderr)
+
+
+def judge(items):
+    """{key: p(work)} for items [(key, path)]. Returns ({}, reason) when unavailable."""
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        return {}, "no TYPESAFE_API_KEY"
+    qs = {}
+    for k, path in items:
+        try:
+            head = open(path, errors="replace").read(1400)
+        except OSError as e:
+            return {}, f"could not read an artifact: {e}"
+        qs[k] = {
+            "type": "noul",
+            "instructions": {
+                "task": "This file is the output a scheduled agent left behind. "
+                        "Did the agent actually do its work?",
+                "artifact": head},
+            "criteria": {
+                "true": "The file contains the work itself: findings, summaries, items read, "
+                        "verdicts — substantive content produced by doing the job.",
+                "false": "The file only reports that the agent was blocked, failed, or could "
+                         "not run: an error, a missing permission, or instructions for fixing "
+                         "it, with no actual work product."}}
+    body = json.dumps({
+        "model": "jev-latest",
+        "state": {"note": "Each artifact is the first ~1400 characters of a file written "
+                          "by a scheduled agent."},
+        "questions": qs}).encode()
+    req = urllib.request.Request(
+        JUDGE_URL, data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            out = json.load(r)
+        return {k: out["answers"][k]["noul"] for k in qs}, None
+    except Exception as e:                      # noqa: BLE001 — any failure degrades to stage 1
+        return {}, f"judge unreachable: {e}"
+
+
+def selftest():
+    """The rule that decides whether a human is interrupted, checked on its own."""
+    fails = []
+
+    def ok(cond, what):
+        print(("  ok    " if cond else "  x     ") + what)
+        if not cond:
+            fails.append(what)
+
+    names = ["Video digest", "Research briefing"]
+    a = "Video digest produced nothing on Fri 26 Sep"
+    b = "Video digest produced nothing on Sat 27 Sep"
+    ok(normalise(a) == normalise(b), "the same fault on two days is one problem, not two")
+    ok(signature([a, b]) == signature([b]), "and finding it again changes nothing")
+    ok(signature([a, b, a]) == signature([a]), "three counts of one fact is one fact")
+
+    c = "Research briefing produced nothing on Sat 27 Sep"
+    ok(signature([a]) != signature([a, c]), "a NEW agent failing is a change, and is reported")
+    ok(signature([a, c]) != signature([c]), "and one of two clearing is a change too")
+    ok(signature([]) == [], "nothing wrong is an empty signature")
+
+    d = "Video digest on Fri 26 Sep wrote only a failure report, not the work"
+    ok(normalise(d) != normalise(a), "producing nothing and writing a failure report are different faults")
+    ok(normalise(d) == normalise(d.replace("Fri 26", "Sat 27")), "but that fault on two days is still one")
+
+    ok("Video digest" in title(signature([a]), names), "the title names the agent, not a count")
+    ok(not title(signature([a]), names)[:1].isdigit(), "and never opens with a number")
+    ok("Research briefing" in title(signature([a, c]), names), "two failures name both")
+
+    print("the watchdog holds" if not fails else f"{len(fails)} failed")
+    return 0 if not fails else 1
+
+
+def main():
+    argv = sys.argv
+    if "--version" in argv:
+        print(f"agent-watchdog {VERSION}")
+        return 0
+    if "--selftest" in argv:
+        return selftest()
+    quiet, no_judge = "--quiet" in argv, "--no-judge" in argv
+    try:
+        days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 3
+        cfg_path = argv[argv.index("--config") + 1] if "--config" in argv else CONFIG
+    except (IndexError, ValueError):
+        sys.exit("usage: agent-watchdog [--quiet] [--no-judge] [--days N] [--config PATH]")
+    try:
+        agents, notify_cmd = load_config(cfg_path)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read config {cfg_path}: {e} (see examples/agents.json)")
+    fixes = {a["name"]: a.get("fix") for a in agents}
+
+    now = datetime.now()
+    # Stage 1: existence.
+    rows, to_judge = [], []
+    for n in range(days):
+        day = now.date() - timedelta(days=n)
+        for a in agents:
+            tmpl = os.path.expanduser(a["output"])
+            path = tmpl.format(Y=f"{day:%Y}", m=f"{day:%m}", d=f"{day:%d}")
+            by_mtime = a.get("by_mtime", False)
+            if day == now.date() and now.hour < a.get("due_hour", 0):
+                continue
+            if by_mtime and day != now.date():
+                continue          # one overwritten file cannot speak for last Tuesday
+            if "*" in path:
+                # Many files: the newest answers "did it run on that day".
+                hits = glob.glob(path)
+                exists = any(date.fromtimestamp(os.path.getmtime(h)) == day for h in hits)
+                if hits:
+                    path = max(hits, key=os.path.getmtime)
+            else:
+                exists = os.path.exists(path)
+                if exists and by_mtime:
+                    exists = date.fromtimestamp(os.path.getmtime(path)) == day
+            key = f"{a['name']}|{day}"
+            rows.append({"key": key, "name": a["name"], "day": day, "path": path,
+                         "exists": exists, "paused": a.get("paused", False)})
+            if exists and a.get("judge", True) and not by_mtime:
+                to_judge.append((key, path))
+
+    # Stage 2: is each existing artifact the work, or a report of failure?
+    scores, degraded = {}, None
+    if no_judge:
+        degraded = "--no-judge"
+    elif to_judge:
+        scores, degraded = judge(to_judge)
+
+    lines, problems = [], []
+    for r in rows:
+        tag = f"{r['name']:32s} {r['day']:%a %d %b}"
+        if r["paused"]:
+            lines.append(f"  - {tag}  paused on purpose")
+            continue
+        if not r["exists"]:
+            problems.append(f"{r['name']} produced nothing on {r['day']:%a %d %b}")
+            lines.append(f"  x {tag}  nothing")
+            continue
+        size = os.path.getsize(r["path"])
+        p = scores.get(r["key"])
+        if p is None:
+            lines.append(f"  ok {tag}  {size:,} bytes")
+        elif p < AMBIGUOUS[0]:
+            problems.append(f"{r['name']} on {r['day']:%a %d %b} wrote only a failure report, not the work")
+            lines.append(f"  x {tag}  {size:,} bytes - failure report only ({p:.2f})")
+        elif p < AMBIGUOUS[1]:
+            problems.append(f"{r['name']} on {r['day']:%a %d %b} may not have done real work - worth a look")
+            lines.append(f"  ? {tag}  {size:,} bytes - unclear ({p:.2f})")
+        else:
+            lines.append(f"  ok {tag}  {size:,} bytes  ({p:.2f})")
+
+    if not quiet or problems:
+        print(f"Agent watchdog - did each agent do its work? (last {days} days)")
+        print("\n".join(lines) if lines else "  (nothing due yet today)")
+        if degraded:
+            # Never downgrade silently: a weaker check must announce itself.
+            print(f"  (existence only - {degraded}; a blocked run can pass this way)")
+
+    # Report on a CHANGE, never on a run: the same fault found again is not news.
+    was = read_state()
+    now_sig = signature(problems)
+    if not problems:
+        if not quiet:
+            print("\nevery agent did its work")
+        if was.get("signature"):
+            notify(notify_cmd, "\U0001f7e2", "Agents are back to normal",
+                   "Everything that was failing is doing its work again:\n"
+                   + "\n".join("- " + p for p in was["signature"]))
+            write_state({})
+        return 0
+
+    changed = now_sig != was.get("signature", [])
+    if not quiet:
+        print(f"\n{len(problems)} problem(s)" + ("" if changed else "  (already reported)"))
+    if changed:
+        out = []
+        for p in now_sig[:12]:
+            fix = next((f for name, f in fixes.items() if f and p.startswith(name)), None)
+            out.append("- " + p + (f"\n  Fix: {fix}" if fix else ""))
+        body = "\n".join(out)
+        if degraded:
+            body += f"\n- (checked by file existence only - {degraded})"
+        body += f"\n\nFound {now:%Y-%m-%d}. This stays quiet until it changes."
+        notify(notify_cmd, "\U0001f534", title(now_sig, fixes), body)
+        write_state({"signature": now_sig, "since": f"{now:%Y-%m-%d}"})
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
